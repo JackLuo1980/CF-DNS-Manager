@@ -1,6 +1,27 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Globe, Server, User, Shield, Key, LogOut, Plus, Trash2, Edit2, ExternalLink, RefreshCw, Zap, Languages, CheckCircle, AlertCircle, X, Search, ChevronDown, Upload, Download, Copy, Github } from 'lucide-react';
 
+// JWT Helpers
+const decodeJWT = (token) => {
+    try {
+        let base64Url = token.split('.')[1];
+        let base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+        let jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+            return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+        }).join(''));
+        return JSON.parse(jsonPayload);
+    } catch (e) {
+        return null;
+    }
+};
+
+const isTokenExpired = (token) => {
+    const payload = decodeJWT(token);
+    if (!payload || !payload.exp) return true;
+    // 5 seconds buffer
+    return (Date.now() / 1000) > (payload.exp - 5);
+};
+
 // Translations
 const translations = {
     zh: {
@@ -646,7 +667,10 @@ const Login = ({ onLogin, t, lang, onLangChange }) => {
                                 type="button"
                                 className="btn btn-outline"
                                 style={{ width: '100%', justifyContent: 'center', gap: '8px', border: '1px solid #e2e8f0' }}
-                                onClick={() => window.location.href = '/api/auth/github'}
+                                onClick={() => {
+                                    sessionStorage.setItem('oauth_remember', remember ? 'true' : 'false');
+                                    window.location.href = '/api/auth/github';
+                                }}
                             >
                                 <Github size={18} />
                                 {t('githubLogin')}
@@ -753,7 +777,11 @@ const ZoneDetail = ({ zone, zones, onSwitchZone, onRefreshZones, zonesLoading, a
         setLoading(true);
         try {
             const res = await fetch(`/api/zones/${zone.id}/dns_records`, { headers: getHeaders() });
-            if (res.status === 401) { setLoading(false); return; }
+            if (res.status === 401) { 
+                if (logoutRef.current) logoutRef.current();
+                setLoading(false); 
+                return; 
+            }
             const data = await res.json();
             if (res.ok) {
                 setRecords((data.result || []).sort((a, b) => new Date(b.modified_on) - new Date(a.modified_on)));
@@ -772,6 +800,7 @@ const ZoneDetail = ({ zone, zones, onSwitchZone, onRefreshZones, zonesLoading, a
         try {
             const res = await fetch(`/api/zones/${zone.id}/custom_hostnames`, { headers: getHeaders() });
             if (!res.ok) {
+                if (res.status === 401 && logoutRef.current) logoutRef.current();
                 const errorData = await res.json();
                 throw new Error(errorData.message || 'Failed to fetch custom hostnames');
             }
@@ -2075,7 +2104,27 @@ const ZoneDetail = ({ zone, zones, onSwitchZone, onRefreshZones, zonesLoading, a
 
 const App = () => {
     const { t, lang, changeLang, toggleLang } = useTranslate();
-    const [auth, setAuth] = useState(null);
+    const [auth, setAuth] = useState(() => {
+        const saved = localStorage.getItem('auth_session') || sessionStorage.getItem('auth_session');
+        if (saved) {
+            try {
+                const credentials = JSON.parse(saved);
+                if (credentials.mode === 'server' && credentials.token) {
+                    if (isTokenExpired(credentials.token)) {
+                        localStorage.removeItem('auth_session');
+                        sessionStorage.removeItem('auth_session');
+                        return null;
+                    }
+                }
+                return credentials;
+            } catch (e) {
+                localStorage.removeItem('auth_session');
+                sessionStorage.removeItem('auth_session');
+                return null;
+            }
+        }
+        return null;
+    });
     const [showAccountSelector, setShowAccountSelector] = useState(false);
     const accountSelectorRef = useRef(null);
     const [zones, setZones] = useState([]);
@@ -2142,8 +2191,9 @@ const App = () => {
                 } else {
                     setSelectedZone(null);
                 }
-            } else if (res.status !== 401) {
-                // Don't show error toast for 401, the global interceptor handles logout
+            } else if (res.status === 401) {
+                if (logoutRef.current) logoutRef.current();
+            } else {
                 const errorMsg = data.errors?.[0]?.message || data.message || data.error || t('errorOccurred');
                 showToast(errorMsg, 'error');
             }
@@ -2166,26 +2216,44 @@ const App = () => {
                 // Clear hash to prevent re-login on refresh
                 window.history.replaceState(null, '', window.location.pathname);
 
+                // Re-hydrate remember state
+                const oauthRemember = sessionStorage.getItem('oauth_remember');
+                let rememberPreference = true; // backward compatible default
+                if (oauthRemember !== null) {
+                    rememberPreference = oauthRemember === 'true';
+                    sessionStorage.removeItem('oauth_remember'); // clean up
+                }
+
                 const credentials = {
                     mode,
                     token,
-                    remember: true, // Default to true for OAuth
+                    remember: rememberPreference,
                     accounts: [] // Will be populated by fetchZones if backend supports auto-discovery
                 };
                 handleLogin(credentials);
             }
         }
 
-        const saved = localStorage.getItem('auth_session') || sessionStorage.getItem('auth_session');
-        if (saved) {
-            try {
-                const credentials = JSON.parse(saved);
-                setAuth(credentials);
-                fetchZones(credentials);
-            } catch (e) {
-                localStorage.removeItem('auth_session');
-                sessionStorage.removeItem('auth_session');
-            }
+        if (auth && auth.mode === 'server' && auth.token) {
+            fetch('/api/refresh', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${auth.token}` }
+            }).then(async res => {
+                if (res.ok) {
+                    const data = await res.json();
+                    const newCreds = { ...auth, token: data.token };
+                    setAuth(newCreds); // Update active state
+                    if (auth.remember) {
+                        localStorage.setItem('auth_session', JSON.stringify(newCreds));
+                    } else {
+                        sessionStorage.setItem('auth_session', JSON.stringify(newCreds));
+                    }
+                }
+            }).catch(() => {});
+        }
+        
+        if (auth) {
+            fetchZones(auth);
         }
     }, []);
 
@@ -2227,36 +2295,7 @@ const App = () => {
     // Keep logoutRef always pointing to the latest handleLogout
     logoutRef.current = handleLogout;
 
-    // Global fetch interceptor to handle 401 Unauthorized (JWT expiration) globally
-    useEffect(() => {
-        if (!window.__originalFetch) {
-            window.__originalFetch = window.fetch;
-            window.fetch = async (...args) => {
-                const res = await window.__originalFetch(...args);
-                const url = args[0] ? args[0].toString() : '';
-                // Only intercept API calls that require authentication
-                if (
-                    res.status === 401 && 
-                    url.startsWith('/api/') && 
-                    !url.includes('/api/login') && 
-                    !url.includes('/api/auth/config') && 
-                    !url.includes('/api/verify-token') &&
-                    !url.includes('/api/auth/github')
-                ) {
-                    window.dispatchEvent(new Event('auth-expired'));
-                }
-                return res;
-            };
-        }
 
-        const handleAuthExpired = () => {
-            // Use ref to always call the latest handleLogout, avoiding stale closure
-            if (logoutRef.current) logoutRef.current();
-        };
-
-        window.addEventListener('auth-expired', handleAuthExpired);
-        return () => window.removeEventListener('auth-expired', handleAuthExpired);
-    }, []);
 
     if (!auth) {
         return <Login onLogin={handleLogin} t={t} lang={lang} onLangChange={changeLang} />;
